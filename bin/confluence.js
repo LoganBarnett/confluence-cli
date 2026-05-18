@@ -1952,6 +1952,141 @@ profileCmd
     }
   });
 
+// API command (arbitrary authenticated requests, modeled after gh api)
+program
+  .command('api <endpoint>')
+  .description('Make an authenticated API request (like gh api)')
+  .option('-X, --method <method>', 'HTTP method (default: GET, auto-POST when body provided)')
+  .option('-f, --field <key=value>', 'Add a request field (repeatable)', (v, a) => { a.push(v); return a; }, [])
+  .option('-H, --header <key:value>', 'Add a request header (repeatable)', (v, a) => { a.push(v); return a; }, [])
+  .option('--input <file>', 'Read body from file (use - for stdin)')
+  .option('--jq <expression>', 'Filter response with jq')
+  .option('-i, --include', 'Include response status and headers')
+  .option('--silent', 'Suppress all output')
+  .action(async (endpoint, options) => {
+    const analytics = new Analytics();
+    try {
+      const config = getConfig(getProfileName());
+      const client = new ConfluenceClient(config);
+
+      // Parse fields
+      const fields = {};
+      for (const raw of options.field) {
+        const idx = raw.indexOf('=');
+        if (idx === -1) {
+          console.error(chalk.red(`Error: Invalid field "${raw}". Must be key=value.`));
+          process.exit(1);
+        }
+        fields[raw.slice(0, idx)] = raw.slice(idx + 1);
+      }
+
+      // Parse headers
+      const extraHeaders = {};
+      for (const raw of options.header) {
+        const idx = raw.indexOf(':');
+        if (idx === -1) {
+          console.error(chalk.red(`Error: Invalid header "${raw}". Must be key:value.`));
+          process.exit(1);
+        }
+        extraHeaders[raw.slice(0, idx).trim()] = raw.slice(idx + 1).trim();
+      }
+
+      // Determine method
+      const hasFields = Object.keys(fields).length > 0;
+      let body = undefined;
+      if (options.input) {
+        const fs = require('fs');
+        let raw;
+        if (options.input === '-') {
+          raw = fs.readFileSync(process.stdin.fd, 'utf-8');
+        } else {
+          raw = fs.readFileSync(options.input, 'utf-8');
+        }
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          body = raw;
+        }
+      }
+
+      const hasBody = hasFields || body !== undefined;
+      const method = (options.method || (hasBody ? 'POST' : 'GET')).toUpperCase();
+
+      // Read-only enforcement
+      const WRITE_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
+      if (config.readOnly && WRITE_METHODS.includes(method)) {
+        console.error(chalk.red('Error: This profile is in read-only mode. Write operations are not allowed.'));
+        console.error(chalk.yellow('Tip: Use "confluence profile add <name>" without --read-only, or set readOnly to false in config.'));
+        process.exit(1);
+      }
+
+      // Build request options
+      const reqOpts = { headers: extraHeaders };
+      if (method === 'GET' || method === 'HEAD') {
+        if (hasFields) {
+          reqOpts.params = fields;
+        }
+      } else {
+        if (body !== undefined && hasFields) {
+          reqOpts.data = typeof body === 'object' && body !== null ? { ...body, ...fields } : fields;
+        } else if (hasFields) {
+          reqOpts.data = fields;
+        } else if (body !== undefined) {
+          reqOpts.data = body;
+        }
+      }
+
+      const result = await client.rawRequest(method, endpoint, reqOpts);
+
+      if (options.silent) {
+        analytics.track('api', true);
+        return;
+      }
+
+      let output = '';
+      if (options.include) {
+        output += `HTTP ${result.status}\n`;
+        for (const [key, value] of Object.entries(result.headers)) {
+          output += `${key}: ${value}\n`;
+        }
+        output += '\n';
+      }
+
+      const bodyStr = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
+
+      if (options.jq) {
+        const { execSync } = require('child_process');
+        try {
+          const filtered = execSync(`jq ${JSON.stringify(options.jq)}`, {
+            input: typeof result.data === 'string' ? result.data : JSON.stringify(result.data),
+            encoding: 'utf-8',
+          });
+          output += filtered;
+        } catch {
+          process.exit(2);
+        }
+      } else {
+        output += bodyStr;
+      }
+
+      process.stdout.write(output);
+      if (!output.endsWith('\n')) {
+        process.stdout.write('\n');
+      }
+      analytics.track('api', true);
+    } catch (error) {
+      analytics.track('api', false);
+      if (error.response) {
+        const errBody = error.response.data;
+        const errStr = typeof errBody === 'string' ? errBody : JSON.stringify(errBody, null, 2);
+        process.stderr.write(errStr + '\n');
+      } else {
+        console.error(chalk.red('Error:'), error.message);
+      }
+      process.exit(1);
+    }
+  });
+
 // Convert command (local format conversion, no server connection required)
 const VALID_INPUT_FORMATS = ['markdown', 'storage', 'html'];
 const VALID_OUTPUT_FORMATS = ['markdown', 'storage', 'html', 'text'];
